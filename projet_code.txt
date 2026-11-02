@@ -1,0 +1,1986 @@
+=== src/main.rs ===
+mod bots;
+mod engine;
+mod api;
+
+use crate::api::*;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
+
+    let api = Api::new();
+
+    api.loop_event().await?;
+
+    Ok(())
+}
+=== src/engine/mod.rs ===
+pub mod color;
+pub mod square;
+pub mod piece;
+pub mod bitboard;
+pub mod attacks;
+pub mod board;
+pub mod fen;
+pub mod moves;
+pub mod play;
+pub mod checks;
+pub mod movegen;
+pub mod perft;
+
+pub use color::Color;
+pub use square::Square;
+pub use piece::Piece;
+pub use bitboard::Bitboard;
+pub use moves::Move;
+pub use board::Board;
+=== src/engine/color.rs ===
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Color {
+    White,
+    Black,
+}
+
+impl Color {
+    pub fn opposite(self) -> Color {
+        match self {
+            Color::White => Color::Black,
+            Color::Black => Color::White,
+        }
+    }
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opposite_of_white_is_black() {
+        assert_eq!(Color::White.opposite(), Color::Black)
+    }
+
+    #[test]
+    fn opposite_of_black_is_white() {
+        assert_eq!(Color::Black.opposite(), Color::White)
+    }
+
+    #[test]
+    fn opposite_twice_return_original() {
+        for c in [Color::White, Color::Black] {
+            assert_eq!(c.opposite().opposite(), c, "pour {c:?}");
+        }
+    }
+}
+=== src/engine/square.rs ===
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Square(u8);
+
+impl Square {
+    pub fn new(index: u8) -> Option<Square> {
+        if index < 64 {
+            Some(Square(index))
+        } else {
+            None
+        }
+    }
+
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    pub fn file(self) -> u8 {
+        self.0 % 8
+    }
+
+    pub fn rank(self) -> u8 {
+        self.0 / 8
+    }
+
+    pub fn to_uci(self) -> String {
+        let letter = (b'a' + self.file()) as char;
+        let digit = (b'1' + self.rank()) as char;
+        format!("{letter}{digit}")
+    }
+
+    pub fn from_uci(s: &str) -> Option<Square> {
+        // Exactement 2 octets, sinon None. Aucun accès par index : impossible de paniquer.
+        let &[file, rank] = s.as_bytes() else {
+            return None;
+        };
+
+        let file = file.wrapping_sub(b'a');
+        let rank = rank.wrapping_sub(b'1');
+
+        if file < 8 && rank < 8 {
+            Some(Square(rank * 8 + file))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn square_accept_0_to_63() {
+        for i in 0..64 {
+            assert!(Square::new(i).is_some(), "index {i}")
+        }
+    }
+
+    #[test]
+    fn square_reject_above_63() {
+        assert!(Square::new(64).is_none());
+        assert!(Square::new(255).is_none());
+    }
+
+    #[test]
+    fn index_returns_the_inner_value() {
+        assert_eq!(Square::new(0).unwrap().index(), 0);
+        assert_eq!(Square::new(28).unwrap().index(), 28);
+        assert_eq!(Square::new(63).unwrap().index(), 63);
+    }
+
+    #[test]
+    fn file_and_rank_of_a1() {
+        let a1 = Square::new(0).unwrap();
+        assert_eq!((a1.file(), a1.rank()), (0, 0));
+    }
+
+    #[test]
+    fn file_and_rank_of_h1() {
+        let h1 = Square::new(7).unwrap();
+        assert_eq!((h1.file(), h1.rank()), (7, 0));
+    }
+
+    #[test]
+    fn file_and_rank_of_a2() {
+        let a2 = Square::new(8).unwrap();
+        assert_eq!((a2.file(), a2.rank()), (0, 1));
+    }
+
+    #[test]
+    fn file_and_rank_of_e4() {
+        let e4 = Square::new(28).unwrap();
+        assert_eq!((e4.file(), e4.rank()), (4, 3));
+    }
+
+    #[test]
+    fn file_and_rank_of_h8() {
+        let h8 = Square::new(63).unwrap();
+        assert_eq!((h8.file(), h8.rank()), (7, 7));
+    }
+
+    #[test]
+    fn file_and_rank_rebuild_the_index_for_all_squares() {
+        for i in 0..64u8 {
+            let sq = Square::new(i).unwrap();
+            assert_eq!(sq.rank() * 8 + sq.file(), i, "case {i}");
+        }
+    }
+
+    #[test]
+    fn to_uci_of_known_squares() {
+        let cases = [(0, "a1"), (7, "h1"), (28, "e4"), (56, "a8"), (63, "h8")];
+        for (index, expected) in cases {
+            assert_eq!(
+                Square::new(index).unwrap().to_uci(),
+                expected,
+                "index {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn to_uci_0_to_63() {
+        for il in 0..8 {
+            for ic in 0..8 {
+                let l = (b'a' + il) as char;
+                let c = (b'1' + ic) as char;
+
+                let index = ic * 8 + il;
+                let case = Square::new(index).unwrap();
+
+                assert_eq!(case.to_uci(), format!("{l}{c}"), "index {index}");
+            }
+        }
+    }
+
+        #[test]
+    fn from_uci_of_known_squares() {
+        let cases = [("a1", 0), ("h1", 7), ("e4", 28), ("a8", 56), ("h8", 63)];
+        for (text, index) in cases {
+            assert_eq!(
+                Square::from_uci(text).map(|sq| sq.index()),
+                Some(index),
+                "texte {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_uci_rejects_wrong_length() {
+        for text in ["", "a", "e44", "e4 ", " e4", "e2e4"] {
+            assert!(Square::from_uci(text).is_none(), "texte {text:?}");
+        }
+    }
+
+    #[test]
+    fn from_uci_rejects_file_out_of_range() {
+        // "`" est le caractère juste avant 'a', "i" celui juste après 'h'
+        for text in ["`1", "i1", "z1", "A1", "H1"] {
+            assert!(Square::from_uci(text).is_none(), "texte {text:?}");
+        }
+    }
+
+    #[test]
+    fn from_uci_rejects_rank_out_of_range() {
+        // '0' est juste avant '1', '9' juste après '8'
+        for text in ["a0", "a9", "aa", "a/"] {
+            assert!(Square::from_uci(text).is_none(), "texte {text:?}");
+        }
+    }
+
+    #[test]
+    fn from_uci_rejects_swapped_order() {
+        for text in ["1a", "8h", "11"] {
+            assert!(Square::from_uci(text).is_none(), "texte {text:?}");
+        }
+    }
+
+    #[test]
+    fn from_uci_rejects_non_ascii_without_panicking() {
+        // "é" fait 2 octets : il passe le test de longueur et doit échouer sur la lettre
+        for text in ["é", "é1", "aé", "🙂"] {
+            assert!(Square::from_uci(text).is_none(), "texte {text:?}");
+        }
+    }
+
+    #[test]
+    fn from_uci_inverts_to_uci_for_all_squares() {
+        for i in 0..64u8 {
+            let sq = Square::new(i).unwrap();
+            assert_eq!(Square::from_uci(&sq.to_uci()), Some(sq), "index {i}");
+        }
+    }
+
+    #[test]
+    fn to_uci_inverts_from_uci_for_all_valid_texts() {
+        for letter in b'a'..=b'h' {
+            for digit in b'1'..=b'8' {
+                let text = format!("{}{}", letter as char, digit as char);
+                let sq = Square::from_uci(&text).unwrap();
+                assert_eq!(sq.to_uci(), text);
+            }
+        }
+    }
+}
+=== src/engine/piece.rs ===
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum Piece {
+    King,
+    Queen,
+    Pawn,
+    Rook,
+    Bishop,
+    Knight,
+}
+
+impl Piece {
+    pub const ALL: [Piece; 6] = [
+        Piece::Pawn, Piece::Knight, Piece::Bishop,
+        Piece::Rook, Piece::Queen, Piece::King,
+    ];
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+    
+    pub fn from_char(c: char) -> Option<Self> {
+        match c {
+            'k' => Some(Piece::King),
+            'q' => Some(Piece::Queen),
+            'p' => Some(Piece::Pawn),
+            'r' => Some(Piece::Rook),
+            'b' => Some(Piece::Bishop),
+            'n' => Some(Piece::Knight),
+            _ => None
+        }
+    }
+
+    pub fn to_char(self) -> char {
+        match self {
+            Piece::King     => 'k',
+            Piece::Queen    => 'q',
+            Piece::Pawn     => 'p',
+            Piece::Rook     => 'r',
+            Piece::Bishop   => 'b',
+            Piece::Knight   => 'n',
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL: [Piece; 6] = [
+        Piece::Pawn,
+        Piece::Knight,
+        Piece::Bishop,
+        Piece::Rook,
+        Piece::Queen,
+        Piece::King,
+    ];
+
+    #[test]
+    fn know_char_to_piece() {
+        assert_eq!(Piece::from_char('k'), Some(Piece::King));
+        assert_eq!(Piece::from_char('q'), Some(Piece::Queen));
+        assert_eq!(Piece::from_char('p'), Some(Piece::Pawn));
+        assert_eq!(Piece::from_char('r'), Some(Piece::Rook));
+        assert_eq!(Piece::from_char('b'), Some(Piece::Bishop));
+        assert_eq!(Piece::from_char('n'), Some(Piece::Knight));
+    }
+
+    #[test]
+    fn reject_other_char() {
+        let characters = ['B',' ','i','o','K','P'];
+        for c in characters {
+            assert_eq!(Piece::from_char(c), None, "char : {c}");
+        }
+    }
+
+    #[test]
+    fn piece_to_char() {
+        assert_eq!(Piece::King.to_char(), 'k');
+        assert_eq!(Piece::Queen.to_char(), 'q');
+        assert_eq!(Piece::Pawn.to_char(), 'p');
+        assert_eq!(Piece::Rook.to_char(), 'r');
+        assert_eq!(Piece::Bishop.to_char(), 'b');
+        assert_eq!(Piece::Knight.to_char(), 'n');
+    }
+
+    #[test]
+    fn comeback_know_char() {
+        let characters = ['k','q','p','r','b','n'];
+        for c in characters {
+            assert_eq!(Piece::from_char(c).unwrap().to_char(), c, "char : {c}")
+        }
+    }
+
+        #[test]
+    fn from_char_accepts_exactly_kqprbn_among_ascii() {
+        for byte in 0u8..128 {
+            let c = byte as char;
+            assert_eq!(
+                Piece::from_char(c).is_some(),
+                "kqprbn".contains(c),
+                "char {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_char_inverts_to_char_for_all_pieces() {
+        for piece in ALL {
+            assert_eq!(Piece::from_char(piece.to_char()), Some(piece), "piece {piece:?}");
+        }
+    }
+
+    #[test]
+    fn to_char_gives_a_different_char_for_each_piece() {
+        let mut seen = std::collections::HashSet::new();
+        for piece in ALL {
+            assert!(seen.insert(piece.to_char()), "doublon pour {piece:?}");
+        }
+        assert_eq!(seen.len(), 6);
+    }
+
+    // dans piece.rs
+    #[test]
+    fn piece_indices_are_0_to_5_without_duplicates() {
+        let mut indices: Vec<usize> = Piece::ALL.iter().map(|p| p.index()).collect();
+        indices.sort();
+        assert_eq!(indices, vec![0, 1, 2, 3, 4, 5]);
+    }
+}=== src/engine/bitboard.rs ===
+use std::ops::{
+    BitOr, BitOrAssign,
+    BitAnd, BitAndAssign,
+    BitXor, BitXorAssign,
+    Not
+};
+
+use super::square::Square;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Bitboard(u64);
+
+impl Bitboard {
+    pub const EMPTY: Bitboard = Bitboard(0);
+
+    pub const FILE_A: Bitboard = Bitboard(0x0101_0101_0101_0101);
+    pub const FILE_B: Bitboard = Bitboard(0x0202_0202_0202_0202);
+    pub const FILE_C: Bitboard = Bitboard(0x0404_0404_0404_0404);
+    pub const FILE_D: Bitboard = Bitboard(0x0808_0808_0808_0808);
+    pub const FILE_E: Bitboard = Bitboard(0x1010_1010_1010_1010);
+    pub const FILE_F: Bitboard = Bitboard(0x2020_2020_2020_2020);
+    pub const FILE_G: Bitboard = Bitboard(0x4040_4040_4040_4040);
+    pub const FILE_H: Bitboard = Bitboard(0x8080_8080_8080_8080);
+
+    pub const RANK_1: Bitboard = Bitboard(0x0000_0000_0000_00FF);
+    pub const RANK_2: Bitboard = Bitboard(0x0000_0000_0000_FF00);
+    pub const RANK_3: Bitboard = Bitboard(0x0000_0000_00FF_0000);
+    pub const RANK_4: Bitboard = Bitboard(0x0000_0000_FF00_0000);
+    pub const RANK_5: Bitboard = Bitboard(0x0000_00FF_0000_0000);
+    pub const RANK_6: Bitboard = Bitboard(0x0000_FF00_0000_0000);
+    pub const RANK_7: Bitboard = Bitboard(0x00FF_0000_0000_0000);
+    pub const RANK_8: Bitboard = Bitboard(0xFF00_0000_0000_0000);
+
+    pub const fn new(bits: u64) -> Bitboard { Bitboard(bits) }
+    pub const fn bits(self) -> u64 { self.0 }
+
+    pub fn from_square(sq: Square) -> Self {
+        Bitboard(1 << sq.index())
+    }
+
+    pub fn contains(self, sq: Square) -> bool {
+        (self.0 >> sq.index()) & 1 == 1
+    }
+
+    pub fn insert(&mut self, sq: Square) {
+        let mask = Self::from_square(sq);
+        self.0 |= mask.0;
+    }
+
+    pub fn remove(&mut self, sq: Square) {
+        let mask = Self::from_square(sq);
+        self.0 &= !mask.0;
+    }
+
+    pub fn count(self) -> u32 {
+        self.0.count_ones()
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn north(self) -> Bitboard {
+        Bitboard(self.0 << 8)
+    }
+
+    pub fn south(self) -> Bitboard {
+        Bitboard(self.0 >> 8)
+    }
+
+    pub fn east(self) -> Bitboard {
+        Bitboard(self.0 << 1 & !Self::FILE_A.0)
+    }
+
+    pub fn west(self) -> Bitboard {
+        Bitboard(self.0 >> 1 & !Self::FILE_H.0)
+    }
+
+    pub fn north_east(self) -> Bitboard {
+        Bitboard(self.0 << 9 & !Self::FILE_A.0)
+    }
+
+    pub fn north_west(self) -> Bitboard {
+        Bitboard(self.0 << 7 & !Self::FILE_H.0)
+    }
+
+    pub fn south_east(self) -> Bitboard {
+        Bitboard(self.0 >> 7 & !Self::FILE_A.0)
+    }
+
+    pub fn south_west(self) -> Bitboard {
+        Bitboard(self.0 >> 9 & !Self::FILE_H.0)
+    }
+
+    pub fn lsb(self) -> Option<Square> {
+        let index = self.0.trailing_zeros() as u8;
+        Square::new(index)
+    }
+
+    pub fn pop_lsb(&mut self) -> Option<Square> {
+        let sq = self.lsb()?;
+        self.0 &= self.0 - 1;
+        Some(sq)
+    } 
+}
+
+impl Iterator for Bitboard {
+    type Item = Square;
+
+    fn next(&mut self) -> Option<Square> {
+        self.pop_lsb()
+    }
+}
+
+impl BitOr for Bitboard {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Bitboard(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for Bitboard {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0
+    }
+}
+
+impl BitAnd for Bitboard {
+    type Output = Self;
+    fn bitand(self, rhs: Self) -> Self::Output {
+        Bitboard(self.0 & rhs.0)
+    }
+}
+
+impl BitAndAssign for Bitboard {
+    fn bitand_assign(&mut self, rhs: Self) {
+        self.0 &= rhs.0
+    }
+}
+
+impl BitXor for Bitboard {
+    type Output = Self;
+    fn bitxor(self, rhs: Self) -> Self::Output {
+        Bitboard(self.0 ^ rhs.0)
+    }
+}
+
+impl BitXorAssign for Bitboard {
+    fn bitxor_assign(&mut self, rhs: Self) {
+        self.0 ^= rhs.0
+    }
+}
+
+impl Not for Bitboard {
+    type Output = Self;
+    fn not(self) -> Self::Output {
+        Bitboard(!self.0)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_contains_no_square() {
+        for i in 0..64 {
+            let sq = Square::new(i).unwrap();
+            assert!(!Bitboard::EMPTY.contains(sq), "case {i}");
+        }
+    }
+    
+    #[test]
+    fn bitboard_1_contains_square_0() {
+        let bb = Bitboard(1);
+        let sq = Square::new(0).unwrap();
+        assert!(bb.contains(sq))
+    }
+
+    #[test]
+    fn bitboard_2_contains_square_1() {
+        let bb = Bitboard(2);
+        let sq = Square::new(1).unwrap();
+        assert!(bb.contains(sq))
+    }
+
+    #[test]
+    fn bitboard_0xff00_contains_exactly_rank_2() {
+        let bb = Bitboard(0xFF00);
+        for i in 0..64 {
+            let sq = Square::new(i).unwrap();
+            assert_eq!(bb.contains(sq), sq.rank() == 1, "case {i}");
+        }
+    }
+
+        #[test]
+    fn insert_sets_only_that_bit() {
+        let mut bb = Bitboard::EMPTY;
+        bb.insert(Square::new(28).unwrap());   // e4
+        assert_eq!(bb, Bitboard(1 << 28));
+    }
+
+    #[test]
+    fn insert_twice_keeps_the_square() {
+        let mut bb = Bitboard::EMPTY;
+        let sq = Square::new(28).unwrap();
+        bb.insert(sq);
+        bb.insert(sq);
+        assert_eq!(bb, Bitboard(1 << 28));
+    }
+
+    #[test]
+    fn insert_keeps_existing_squares_and_handles_corners() {
+        let mut bb = Bitboard::EMPTY;
+        bb.insert(Square::new(0).unwrap());    // a1
+        bb.insert(Square::new(63).unwrap());   // h8
+        assert_eq!(bb, Bitboard(1 | (1 << 63)));
+    }
+
+    #[test]
+    fn remove_e4_from_bitboard_result_empty() {
+        let mut bb = Bitboard::EMPTY;
+        let sq = Square::new(28).unwrap();
+        bb.insert(sq);
+        bb.remove(sq);
+
+        assert_eq!(bb, Bitboard::EMPTY);
+    }
+
+    #[test]
+    fn count_8_on_bitboard() {
+        assert!(Bitboard(0xFF00).count() == 8)
+    }
+
+    #[test]
+    fn is_empty_on_empty() {
+        assert!(Bitboard::EMPTY.is_empty());
+        assert!(!Bitboard(10).is_empty());
+    }
+
+        #[test]
+    fn from_square_sets_only_that_bit() {
+        assert_eq!(Bitboard::from_square(Square::new(28).unwrap()), Bitboard(1 << 28)); // e4
+        assert_eq!(Bitboard::from_square(Square::new(63).unwrap()), Bitboard(1 << 63)); // h8
+    }
+
+    #[test]
+    fn remove_absent_square_changes_nothing() {
+        let mut bb = Bitboard(0xFF00);
+        bb.remove(Square::new(28).unwrap());
+        assert_eq!(bb, Bitboard(0xFF00));
+    }
+
+    #[test]
+    fn files_contain_exactly_their_squares() {
+        let files = [
+            Bitboard::FILE_A, Bitboard::FILE_B, Bitboard::FILE_C, Bitboard::FILE_D,
+            Bitboard::FILE_E, Bitboard::FILE_F, Bitboard::FILE_G, Bitboard::FILE_H,
+        ];
+        for (f, bb) in files.iter().enumerate() {
+            for i in 0..64 {
+                let sq = Square::new(i).unwrap();
+                assert_eq!(bb.contains(sq), sq.file() as usize == f, "colonne {f}, case {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn ranks_contain_exactly_their_squares() {
+        let ranks = [
+            Bitboard::RANK_1, Bitboard::RANK_2, Bitboard::RANK_3, Bitboard::RANK_4,
+            Bitboard::RANK_5, Bitboard::RANK_6, Bitboard::RANK_7, Bitboard::RANK_8,
+        ];
+        for (r, bb) in ranks.iter().enumerate() {
+            for i in 0..64 {
+                let sq = Square::new(i).unwrap();
+                assert_eq!(bb.contains(sq), sq.rank() as usize == r, "rangée {r}, case {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn operators_behave_as_set_operations() {
+        let a = Bitboard::RANK_1;
+        let b = Bitboard::FILE_A;
+        assert_eq!(a | b, Bitboard(0x0101_0101_0101_01FF));
+        assert_eq!(a & b, Bitboard(1));
+        assert_eq!(a ^ b, Bitboard(0x0101_0101_0101_01FE));
+        assert_eq!(!Bitboard::EMPTY, Bitboard(u64::MAX));
+
+        let (mut or, mut and, mut xor) = (a, a, a);
+        or |= b;
+        and &= b;
+        xor ^= b;
+        assert_eq!((or, and, xor), (a | b, a & b, a ^ b));
+    }
+
+        #[test]
+    fn shifts_move_one_square_and_drop_off_the_board() {
+        let e4 = Bitboard::from_square(Square::new(28).unwrap());
+        let sq = |i| Bitboard::from_square(Square::new(i).unwrap());
+
+        assert_eq!(e4.north(), sq(36));       // e5
+        assert_eq!(e4.south(), sq(20));       // e3
+        assert_eq!(e4.east(), sq(29));        // f4
+        assert_eq!(e4.west(), sq(27));        // d4
+        assert_eq!(e4.north_east(), sq(37));  // f5
+        assert_eq!(e4.north_west(), sq(35));  // d5
+        assert_eq!(e4.south_east(), sq(21));  // f3
+        assert_eq!(e4.south_west(), sq(19));  // d3
+
+        // débordements : la pièce sort du plateau, elle ne réapparaît pas de l'autre côté
+        assert_eq!(Bitboard::FILE_H.east(), Bitboard::EMPTY);
+        assert_eq!(Bitboard::FILE_A.west(), Bitboard::EMPTY);
+        assert_eq!(Bitboard::FILE_H.north_east(), Bitboard::EMPTY);
+        assert_eq!(Bitboard::FILE_A.north_west(), Bitboard::EMPTY);
+        assert_eq!(Bitboard::FILE_H.south_east(), Bitboard::EMPTY);
+        assert_eq!(Bitboard::FILE_A.south_west(), Bitboard::EMPTY);
+        assert_eq!(Bitboard::RANK_8.north(), Bitboard::EMPTY);
+        assert_eq!(Bitboard::RANK_1.south(), Bitboard::EMPTY);
+    }
+
+    #[test]
+    fn iterating_yields_squares_in_increasing_order() {
+        let squares: Vec<usize> = Bitboard(0b1010_0001).map(|sq| sq.index()).collect();
+        assert_eq!(squares, vec![0, 5, 7]);
+        assert_eq!(Bitboard::EMPTY.count(), 0);
+
+        let mut empty = Bitboard::EMPTY;
+        assert_eq!(empty.next(), None);
+    }
+}=== src/engine/attacks.rs ===
+use super::bitboard::Bitboard;
+use super::color::Color;
+use super::square::Square;
+
+pub fn king_attacks(sq: Square) -> Bitboard {
+    let b = Bitboard::from_square(sq);
+    b.north() | b.south() | b.east() | b.west() | b.north_east() | b.north_west() | b.south_east() | b.south_west()
+}
+
+pub fn knight_attacks(sq: Square) -> Bitboard {
+    let b = Bitboard::from_square(sq);
+    b.north().north_east() | b.north().north_west() 
+    | b.east().north_east() | b.west().north_west()
+    | b.south().south_east() | b.south().south_west() 
+    | b.east().south_east() | b.west().south_west()
+}
+
+pub fn pawn_attacks(color: Color, sq: Square) -> Bitboard {
+    let b = Bitboard::from_square(sq);
+    match color {
+        Color::White => {
+            b.north_east() | b.north_west()
+        },
+        Color::Black => {
+            b.south_east() | b.south_west()
+        }
+    }
+}
+
+pub fn rook_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
+    let s1 = slide(sq, occupied, Bitboard::north);
+    let s2 = slide(sq, occupied, Bitboard::south);
+    let s3 = slide(sq, occupied, Bitboard::east);
+    let s4 = slide(sq, occupied, Bitboard::west);
+    s1 | s2 | s3 | s4
+}
+
+pub fn bishop_attacks(sq: Square, occupied: Bitboard) -> Bitboard{
+    let s1 = slide(sq, occupied, Bitboard::north_east);
+    let s2 = slide(sq, occupied, Bitboard::north_west);
+    let s3 = slide(sq, occupied, Bitboard::south_east);
+    let s4 = slide(sq, occupied, Bitboard::south_west);
+    s1 | s2 | s3 | s4
+}
+
+pub fn queen_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
+    rook_attacks(sq, occupied) | bishop_attacks(sq, occupied)
+}
+
+fn slide(sq: Square, occupied: Bitboard, step: fn(Bitboard) -> Bitboard) -> Bitboard {
+    let mut result = Bitboard::EMPTY;
+    let mut ray = Bitboard::from_square(sq);
+    loop {
+        ray = step(ray);
+        if ray.is_empty() {break}
+        result |= ray;
+        if !(ray & occupied).is_empty() {break}
+    }
+    result
+}
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn king_attacks_count_by_position() {
+        assert_eq!(king_attacks(Square::new(28).unwrap()).count(), 8); // e4
+        assert_eq!(king_attacks(Square::new(0).unwrap()).count(), 3);  // a1
+        assert_eq!(king_attacks(Square::new(4).unwrap()).count(), 5);  // e1
+        assert_eq!(king_attacks(Square::new(0).unwrap()), Bitboard::new(0x302)); // a1 : b1, a2, b2
+    }
+
+    #[test]
+    fn knight_attacks_known_squares() {
+        assert_eq!(knight_attacks(Square::new(28).unwrap()).count(), 8); // e4 : le milieu
+        assert_eq!(knight_attacks(Square::new(4).unwrap()).count(), 4);  // e1 : le bord
+        // a1 : seulement b3 (index 17) et c2 (index 10)
+        assert_eq!(knight_attacks(Square::new(0).unwrap()), Bitboard::new((1 << 17) | (1 << 10)));
+    }
+
+    #[test]
+    fn pawn_attacks_by_color_and_edge() {
+        assert_eq!(pawn_attacks(Color::White, Square::new(28).unwrap()).count(), 2); // e4 : d5, f5
+        assert_eq!(pawn_attacks(Color::White, Square::new(8).unwrap()).count(), 1);  // a2 : seulement b3
+        assert_eq!(pawn_attacks(Color::Black, Square::new(36).unwrap()).count(), 2); // e5 : d4, f4
+    }
+
+    #[test]
+    fn sliding_attacks_known_positions() {
+        let a1 = Square::new(0).unwrap();
+        let e4 = Square::new(28).unwrap();
+
+        // plateau vide
+        assert_eq!(rook_attacks(a1, Bitboard::EMPTY).count(), 14);
+        assert_eq!(bishop_attacks(e4, Bitboard::EMPTY).count(), 13);
+        assert_eq!(queen_attacks(e4, Bitboard::EMPTY).count(), 27);
+
+        // un bloqueur en a4 (index 24) : la tour voit a2, a3, a4 mais pas a5..a8
+        let blocker = Bitboard::from_square(Square::new(24).unwrap());
+        let attacks = rook_attacks(a1, blocker);
+        assert_eq!(attacks.count(), 10);               // 3 vers le haut + 7 vers la droite
+        assert!(attacks.contains(Square::new(24).unwrap()));   // le bloqueur est inclus
+        assert!(!attacks.contains(Square::new(32).unwrap()));  // a5 est masquée
+    }
+}=== src/engine/fen.rs ===
+use std::fmt;
+use super::board::{Board, CastlingRights};
+use super::{Color, Piece, Square};
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum FenError {
+    WrongFieldCount(usize),
+    WrongRankCount(usize),
+    InvalidPiece(char),
+    RankTooLong(usize),
+    RankTooShort(usize),
+    InvalidTurn(String),
+    InvalidCastling(String),
+    InvalidEnPassant(String),
+    InvalidNumber(String),
+}
+
+impl fmt::Display for FenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FenError::WrongFieldCount(n) => write!(f, "FEN: 6 champs attendus, {n} trouvés"),
+            FenError::WrongRankCount(n) => write!(f, "FEN: 8 rangées attendues, {n} trouvées"),
+            FenError::InvalidPiece(c) => write!(f, "FEN: pièce inconnue {c:?}"),
+            FenError::RankTooLong(r) => write!(f, "FEN: la rangée {r} dépasse 8 cases"),
+            FenError::RankTooShort(r) => write!(f, "FEN: la rangée {r} a moins de 8 cases"),
+            FenError::InvalidTurn(s) => write!(f, "FEN: trait invalide {s:?}"),
+            FenError::InvalidCastling(s) => write!(f, "FEN: roque invalide {s:?}"),
+            FenError::InvalidEnPassant(s) => write!(f, "FEN: prise en passant invalide {s:?}"),
+            FenError::InvalidNumber(s) => write!(f, "FEN: nombre invalide {s:?}"),
+        }
+    }
+}
+
+impl std::error::Error for FenError {}
+
+impl Board {
+    pub const START_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
+    pub fn startpos() -> Board {
+        Board::from_fen(Self::START_FEN).expect("FEN de départ valide")
+    }
+
+    pub fn from_fen(fen: &str) -> Result<Board,FenError>{
+        let fields: Vec<&str> = fen.split_whitespace().collect();
+        let &[placement, turn, castling, en_passant, halfmove, fullmove] = fields.as_slice() else {
+            return Err(FenError::WrongFieldCount(fields.len()));
+        };
+
+        let mut b = Board::empty();
+        parse_placement(&mut b, placement)?;
+        b.turn = parse_turn(turn)?;
+        b.castling = parse_castlings(castling)?;
+        b.en_passant = parse_en_passant(en_passant)?;
+        b.halfmove = parse_number(halfmove)?;
+        b.fullmove = parse_number(fullmove)?;
+
+        Ok(b)
+    }
+}
+
+
+fn parse_turn(turn: &str) -> Result<Color,FenError> {
+    match turn {
+        "w" => Ok(Color::White),
+        "b" => Ok(Color::Black),
+        _ => Err(FenError::InvalidTurn(turn.to_string()))
+    }
+}
+
+fn parse_castlings(castling: &str) -> Result<CastlingRights,FenError> {
+    let mut castle = CastlingRights::EMPTY;
+    
+    if castling == "-" {
+        return Ok(CastlingRights::EMPTY)
+    }
+
+    for c in castling.chars() {
+        match c {
+            'K' => { castle.white_kingside = true }
+            'Q' => { castle.white_queenside = true }
+            'k' => { castle.black_kingside = true }
+            'q' => { castle.black_queenside = true }
+            _ => return Err(FenError::InvalidCastling(castling.to_string()))
+        }
+    }
+    Ok(castle)
+}
+
+fn parse_en_passant(text: &str) -> Result<Option<Square>, FenError> {
+    if text == "-" {
+        return Ok(None);
+    }
+    match Square::from_uci(text) {
+        // rangée "3" = 2 et rangée "6" = 5 en numérotation interne
+        Some(sq) if sq.rank() == 2 || sq.rank() == 5 => Ok(Some(sq)),
+        _ => Err(FenError::InvalidEnPassant(text.to_string())),
+    }
+}
+
+fn parse_number(text: &str) -> Result<u16, FenError> {
+    text.parse().map_err(|_| FenError::InvalidNumber(text.to_string()))
+}
+
+fn parse_placement(board: &mut Board, placement: &str) -> Result<(), FenError> {
+    let ranks: Vec<&str> = placement.split('/').collect();
+    if ranks.len() != 8 {
+        return Err(FenError::WrongRankCount(ranks.len()));
+    }
+
+    for (i, rank_text) in ranks.iter().enumerate() {
+        let rank = 7 - i; // la 1re rangée du texte est la rangée 8
+        let mut file = 0usize;
+
+        for c in rank_text.chars() {
+            // un chiffre = autant de cases vides
+            if let Some(n) = c.to_digit(10) {
+                if n == 0 {
+                    return Err(FenError::InvalidPiece(c));
+                }
+                file += n as usize;
+                if file > 8 {
+                    return Err(FenError::RankTooLong(rank));
+                }
+                continue;
+            }
+
+            // sinon une pièce : minuscule = noir, majuscule = blanc
+            let piece = Piece::from_char(c.to_ascii_lowercase()).ok_or(FenError::InvalidPiece(c))?;
+            let color = if c.is_ascii_uppercase() { Color::White } else { Color::Black };
+
+            if file >= 8 {
+                return Err(FenError::RankTooLong(rank));
+            }
+            let Some(sq) = Square::new((rank * 8 + file) as u8) else {
+                return Err(FenError::RankTooLong(rank)); // inatteignable : rank et file sont < 8
+            };
+            board.put_piece(color, piece, sq);
+            file += 1;
+        }
+
+        if file < 8 {
+            return Err(FenError::RankTooShort(rank));
+        }
+    }
+    Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_fen_startpos() {
+        let board = Board::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        assert_eq!(board.occupied().count(), 32);
+        assert_eq!(board.piece_at(Square::from_uci("e1").unwrap()), Some((Color::White, Piece::King)));
+        assert_eq!(board.piece_at(Square::from_uci("d8").unwrap()), Some((Color::Black, Piece::Queen)));
+        assert_eq!(board.turn, Color::White);
+        let mut full = CastlingRights::EMPTY;
+        full.white_kingside = true;
+        full.white_queenside = true;
+        full.black_kingside = true;
+        full.black_queenside = true;
+
+        assert_eq!(board.castling, full);
+        assert_eq!(board.en_passant, None);
+    }
+
+    #[test]
+    fn from_fen_rejects_garbage() {
+        assert!(Board::from_fen("").is_err());
+        assert!(Board::from_fen("rnbqkbnr/pppppppp w").is_err());
+    }
+
+    #[test]
+    fn from_fen_reads_turn_and_en_passant() {
+        let b = Board::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1").unwrap();
+        assert_eq!(b.turn, Color::Black);
+        assert_eq!(b.en_passant, Some(Square::from_uci("e3").unwrap()));
+        assert_eq!(b.piece_at(Square::from_uci("e4").unwrap()), Some((Color::White, Piece::Pawn)));
+    }
+
+    #[test]
+    fn from_fen_reports_the_right_error() {
+        let start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR";
+        let cases = [
+            ("".to_string(), FenError::WrongFieldCount(0)),
+            (format!("{start} w KQkq -"), FenError::WrongFieldCount(4)),
+            ("8/8/8 w - - 0 1".to_string(), FenError::WrongRankCount(3)),
+            (format!("{start} x KQkq - 0 1"), FenError::InvalidTurn("x".into())),
+            (format!("{start} w KQkz - 0 1"), FenError::InvalidCastling("KQkz".into())),
+            (format!("{start} w KQkq e5 0 1"), FenError::InvalidEnPassant("e5".into())),
+            (format!("{start} w KQkq - a 1"), FenError::InvalidNumber("a".into())),
+            ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNX w KQkq - 0 1".to_string(), FenError::InvalidPiece('X')),
+            ("rnbqkbnr/ppppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string(), FenError::RankTooLong(6)),
+            ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBN w KQkq - 0 1".to_string(), FenError::RankTooShort(0)),
+        ];
+        for (fen, expected) in cases {
+            assert_eq!(Board::from_fen(&fen).unwrap_err(), expected, "fen {fen:?}");
+        }
+    }
+
+    #[test]
+    fn from_fen_accepts_no_castling_and_no_en_passant() {
+        let b = Board::from_fen("8/8/8/8/8/8/8/K6k w - - 0 1").unwrap();
+        assert_eq!(b.castling, CastlingRights::EMPTY);
+        assert_eq!(b.en_passant, None);
+        assert_eq!(b.occupied().count(), 2);
+    }
+}=== src/engine/board.rs ===
+use super::Color;
+use super::Piece;
+use super::Bitboard;
+use super::Square;
+
+#[derive(Clone, Copy,PartialEq, Eq, Debug)]
+pub struct CastlingRights {
+    pub white_kingside: bool,
+    pub white_queenside: bool,
+    pub black_kingside: bool,
+    pub black_queenside: bool,
+}
+
+impl CastlingRights {
+    pub const EMPTY: Self = CastlingRights{
+        white_kingside: false,
+        white_queenside: false,
+        black_kingside: false,
+        black_queenside: false
+    };
+
+    
+}
+
+
+#[derive(Clone, Debug)]
+pub struct Board {
+    pieces: [[Bitboard; 6]; 2],
+    by_color: [Bitboard; 2],
+    occupied: Bitboard,
+
+    pub turn: Color,
+    pub castling: CastlingRights,
+    pub en_passant: Option<Square>,
+    pub halfmove: u16,
+    pub fullmove: u16,
+}
+
+impl Board {
+    pub fn empty() -> Board {
+        Board {
+            pieces: [[Bitboard::EMPTY;6];2],
+            by_color: [Bitboard::EMPTY;2],
+            occupied: Bitboard::EMPTY,
+
+            turn: Color::White,
+            castling: CastlingRights::EMPTY,
+            en_passant: None,
+            halfmove: 0,
+            fullmove: 1
+        }
+    }
+
+    pub fn pieces(&self, color: Color, piece: Piece) -> Bitboard {
+        self.pieces[color.index()][piece.index()]
+    }
+
+    pub fn color_bb(&self, color: Color) -> Bitboard {
+        self.by_color[color.index()]
+    }
+    pub fn occupied(&self) -> Bitboard {
+        self.occupied
+    }
+
+    pub fn put_piece(&mut self, color: Color, piece: Piece, sq: Square) {
+        debug_assert!(!self.occupied.contains(sq), "case {sq:?} déjà occupée");
+        self.pieces[color.index()][piece.index()].insert(sq);
+        self.by_color[color.index()].insert(sq);
+        self.occupied.insert(sq);
+    }
+    pub fn remove_piece(&mut self, sq: Square) -> Option<(Color, Piece)> {
+        let (color, piece) = self.piece_at(sq)?;   // case vide : on sort avec None
+        self.pieces[color.index()][piece.index()].remove(sq);
+        self.by_color[color.index()].remove(sq);
+        self.occupied.remove(sq);
+        Some((color, piece))
+    }
+
+    pub fn piece_at(&self, sq: Square) -> Option<(Color, Piece)> {
+        if !self.occupied.contains(sq) {return None}
+
+        let color = if self.by_color[Color::White.index()].contains(sq) {
+            Color::White 
+        } else {
+            Color::Black
+        };
+
+        for piece in Piece::ALL {
+            if self.pieces[color.index()][piece.index()].contains(sq) {
+                return Some((color, piece))
+            }
+        }
+        None
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn put_then_piece_at_then_remove() {
+        let mut board = Board::empty();
+        let e4 = Square::new(28).unwrap();
+        assert_eq!(board.piece_at(e4), None);
+
+        board.put_piece(Color::White, Piece::Knight, e4);
+        assert_eq!(board.piece_at(e4), Some((Color::White, Piece::Knight)));
+        assert_eq!(board.pieces(Color::White, Piece::Knight), Bitboard::from_square(e4));
+        assert_eq!(board.occupied(), Bitboard::from_square(e4));
+
+        assert_eq!(board.remove_piece(e4), Some((Color::White, Piece::Knight)));
+        assert_eq!(board.piece_at(e4), None);
+        assert_eq!(board.occupied(), Bitboard::EMPTY);
+        assert_eq!(board.remove_piece(e4), None);   // retirer une case vide ne fait rien
+    }
+
+    #[test]
+    fn colors_and_occupied_stay_consistent() {
+        let mut board = Board::empty();
+        let a2 = Square::new(8).unwrap();
+        let h8 = Square::new(63).unwrap();
+        board.put_piece(Color::White, Piece::Pawn, a2);
+        board.put_piece(Color::Black, Piece::Rook, h8);
+
+        assert_eq!(board.color_bb(Color::White), Bitboard::from_square(a2));
+        assert_eq!(board.color_bb(Color::Black), Bitboard::from_square(h8));
+        assert_eq!(board.occupied(), Bitboard::from_square(a2) | Bitboard::from_square(h8));
+    }
+}=== src/engine/moves.rs ===
+use super::{Square,Piece};
+
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Move {
+    pub from: Square,
+    pub to: Square,
+    pub prom: Option<Piece>
+}
+
+
+impl Move {
+    pub fn new(from: Square, to: Square, prom: Option<Piece>) -> Move {
+        Move { from, to, prom }
+    }
+
+    pub fn from_uci(s: &str) -> Option<Move> {
+        if s.len() != 4 && s.len() != 5 {
+            return None;
+        }
+
+        let from = Square::from_uci(s.get(0..2)?)?;
+        let to = Square::from_uci(s.get(2..4)?)?;
+
+        let prom = match s.get(4..)? {
+            ""  => None,
+            "q" => Some(Piece::Queen),
+            "r" => Some(Piece::Rook),
+            "b" => Some(Piece::Bishop),
+            "n" => Some(Piece::Knight),
+            _ => return None,
+        };
+
+        Some(Move::new(from, to, prom))
+    }
+
+    pub fn to_uci(self) -> String {
+        let mut all = String::with_capacity(5);
+        all.push_str(&self.from.to_uci());
+        all.push_str(&self.to.to_uci());
+        if let Some(piece) = self.prom {
+            all.push(piece.to_char());
+        }
+        all
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sq(s: &str) -> Square {
+        Square::from_uci(s).unwrap()
+    }
+
+    #[test]
+    fn uci_round_trip_and_parsing() {
+        for s in ["e2e4", "g1f3", "e7e8q", "a2a1n", "e1g1"] {
+            assert_eq!(Move::from_uci(s).unwrap().to_uci(), s);
+        }
+
+        let m = Move::from_uci("e7e8q").unwrap();
+        assert_eq!(m.from, sq("e7"));
+        assert_eq!(m.to, sq("e8"));
+        assert_eq!(m.prom, Some(Piece::Queen));
+        assert_eq!(Move::from_uci("e2e4").unwrap().prom, None);
+    }
+
+    #[test]
+    fn from_uci_rejects_malformed_input() {
+        for s in ["", "e2", "e2e", "e2e4x", "e2e4qq", "e7e8k", "e7e8p", "e9e4", "é2e4", "e2e4é"] {
+            assert!(Move::from_uci(s).is_none(), "{s:?}");
+        }
+    }
+}=== src/engine/play.rs ===
+
+use super::Board;
+use super::Move;
+use super::Piece;
+use super::Square;
+use super::Color;
+
+
+impl Board {
+    pub fn make_move(&mut self, mv: Move) {
+        let us = self.turn;
+        let old_en_passant = self.en_passant;
+
+        let (_, piece) = self.remove_piece(mv.from).unwrap();
+        let captured = self.remove_piece(mv.to);
+
+        // prise en passant : un pion qui change de colonne vers la case de prise en passant
+        let is_en_passant = piece == Piece::Pawn
+            && Some(mv.to) == old_en_passant
+            && mv.from.file() != mv.to.file();
+        if is_en_passant {
+            let sq = Square::new(mv.from.rank() * 8 + mv.to.file()).unwrap();
+            self.remove_piece(sq);
+        }
+
+        self.put_piece(us, mv.prom.unwrap_or(piece), mv.to);
+
+        // roque : la tour saute de l'autre côté du roi
+        if piece == Piece::King && mv.from.file().abs_diff(mv.to.file()) == 2 {
+            let rank = mv.from.rank();
+            let (rook_from, rook_to) = if mv.to.file() == 6 { (7, 5) } else { (0, 3) };
+            let rook_from = Square::new(rank * 8 + rook_from).unwrap();
+            let rook_to = Square::new(rank * 8 + rook_to).unwrap();
+            self.remove_piece(rook_from);
+            self.put_piece(us, Piece::Rook, rook_to);
+        }
+
+        // droits de roque : on regarde départ ET arrivée,
+        // ça couvre « la tour part » et « la tour est capturée »
+        self.lose_castling_rights(mv.from);
+        self.lose_castling_rights(mv.to);
+
+        // double poussée : la case sautée est à mi-chemin
+        self.en_passant = if piece == Piece::Pawn && mv.from.rank().abs_diff(mv.to.rank()) == 2 {
+            Square::new(((mv.from.index() + mv.to.index()) / 2) as u8)
+        } else {
+            None
+        };
+
+        // règle des 50 coups : remise à zéro sur coup de pion ou capture
+        if piece == Piece::Pawn || captured.is_some() || is_en_passant {
+            self.halfmove = 0;
+        } else {
+            self.halfmove += 1;
+        }
+
+        if us == Color::Black {
+            self.fullmove += 1;
+        }
+        self.turn = us.opposite();
+    }
+
+    fn lose_castling_rights(&mut self, sq: Square) {
+        match sq.index() {
+            0 => self.castling.white_queenside = false,
+            7 => self.castling.white_kingside = false,
+            4 => {
+                self.castling.white_kingside = false;
+                self.castling.white_queenside = false;
+            }
+            56 => self.castling.black_queenside = false,
+            63 => self.castling.black_kingside = false,
+            60 => {
+                self.castling.black_kingside = false;
+                self.castling.black_queenside = false;
+            }
+            _ => {}
+        }
+    }
+}=== src/engine/checks.rs ===
+use super::attacks::*;
+use super::{Board, Color, Piece, Square};
+
+impl Board {
+    pub fn king_square(&self, color: Color) -> Option<Square>{
+        self.pieces(color, Piece::King).lsb()
+    }
+
+    pub fn is_attacked(&self, sq: Square, by: Color) -> bool {
+        let occupied = self.occupied();
+
+        let king = self.pieces(by, Piece::King);
+        let knight = self.pieces(by, Piece::Knight);
+        let pawn = self.pieces(by, Piece::Pawn);
+        let diago = self.pieces(by, Piece::Queen) | self.pieces(by, Piece::Bishop);
+        let straight = self.pieces(by, Piece::Queen) | self.pieces(by, Piece::Rook);
+
+        !(king_attacks(sq) & king).is_empty()
+            || !(knight_attacks(sq) & knight).is_empty()
+            || !(pawn_attacks(by.opposite(), sq) & pawn).is_empty()
+            || !(bishop_attacks(sq, occupied) & diago).is_empty()
+            || !(rook_attacks(sq, occupied) & straight).is_empty()
+    }
+
+    pub fn in_check(&self) -> bool {
+        match self.king_square(self.turn) {
+            Some(king) => self.is_attacked(king, self.turn.opposite()),
+            None => false
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn in_check(fen: &str) -> bool {
+        Board::from_fen(fen).unwrap().in_check()
+    }
+
+    #[test]
+    fn detects_each_kind_of_attacker_and_blockers() {
+        // position de départ : pas d'échec
+        assert!(!in_check("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"));
+
+        assert!(in_check("4k3/8/8/8/8/5n2/8/4K3 w - - 0 1"));   // cavalier f3 attaque e1
+        assert!(in_check("4k3/8/8/8/8/8/3p4/4K3 w - - 0 1"));   // pion noir d2 attaque e1
+        assert!(in_check("k7/8/8/8/7b/8/8/4K3 w - - 0 1"));     // fou h4 attaque e1 (diagonale)
+        assert!(in_check("k3r3/8/8/8/8/8/8/4K3 w - - 0 1"));    // tour e8 attaque e1 (colonne)
+
+        // un bloqueur coupe l'attaque, et un pion blanc en d2 n'attaque pas e1
+        assert!(!in_check("k3r3/8/8/8/8/8/4P3/4K3 w - - 0 1"));
+        assert!(!in_check("4k3/8/8/8/8/8/3P4/4K3 w - - 0 1"));
+    }
+}=== src/engine/movegen.rs ===
+use super::attacks::*;
+use super::{Board, Move, Piece, Color, Bitboard, Square};
+
+
+impl Board {
+    fn king_moves(&self, moves: &mut Vec<Move>) {
+        let us = self.turn;
+        let own = self.color_bb(us);
+
+        for from in self.pieces(us, Piece::King) {
+            let target = king_attacks(from) & !own;
+            for to in target {
+                moves.push(Move::new(from, to, None));
+            }
+        }
+    }
+
+    fn queen_moves(&self, moves: &mut Vec<Move>) {
+        let us = self.turn;
+        let own = self.color_bb(us);
+
+        for from in self.pieces(us, Piece::Queen) {
+            let target = queen_attacks(from, self.occupied()) & !own;
+            for to in target {
+                moves.push(Move::new(from, to, None));
+            }
+        }
+    }
+
+    fn rook_moves(&self, moves: &mut Vec<Move>) {
+        let us = self.turn;
+        let own = self.color_bb(us);
+
+        for from in self.pieces(us, Piece::Rook) {
+            let target = rook_attacks(from, self.occupied()) & !own;
+            for to in target {
+                moves.push(Move::new(from, to, None));
+            }
+        }
+    }
+
+    fn bishop_moves(&self, moves: &mut Vec<Move>) {
+        let us = self.turn;
+        let own = self.color_bb(us);
+
+        for from in self.pieces(us, Piece::Bishop) {
+            let target = bishop_attacks(from, self.occupied()) & !own;
+            for to in target {
+                moves.push(Move::new(from, to, None));
+            }
+        }
+    }
+
+    fn knight_moves(&self, moves: &mut Vec<Move>) {
+        let us = self.turn;
+        let own = self.color_bb(us);
+
+        for from in self.pieces(us, Piece::Knight) {
+            let target = knight_attacks(from) & !own;
+            for to in target {
+                moves.push(Move::new(from, to, None));
+            }
+        }
+    }
+
+    fn pawn_moves(&self, moves: &mut Vec<Move>) {
+        let us = self.turn;
+        let empty = !self.occupied();
+
+        let (start_rank, promo_rank) = match us {
+            Color::White => (1,7),
+            Color::Black => (6,0)
+        };
+
+        let forward = |b: Bitboard| match us {
+            Color::White => b.north(),
+            Color::Black => b.south(),
+        };
+
+        let mut target = self.color_bb(us.opposite());
+        if let Some(ep) = self.en_passant { target.insert(ep) }
+
+        for from in self.pieces(us, Piece::Pawn) {
+            let one = forward(Bitboard::from_square(from)) & empty;
+
+            for to in one {
+                push_pawn_move(moves, from, to, promo_rank);
+            }
+
+            if from.rank() == start_rank {
+                let two = forward(one) & empty;
+                for to in two {
+                    moves.push(Move::new(from, to, None));
+                }
+            }
+
+            for to in target & pawn_attacks(us, from) {
+                push_pawn_move(moves, from, to, promo_rank);
+            } 
+        }
+    }
+
+    fn castle_moves(&self, moves: &mut Vec<Move>) {
+        let us = self.turn;
+        let them = us.opposite();
+
+        // (droit petit roque, droit grand roque, index de la première case de la rangée de base)
+        let (kingside, queenside, base) = match us {
+            Color::White => (self.castling.white_kingside, self.castling.white_queenside, 0u8),
+            Color::Black => (self.castling.black_kingside, self.castling.black_queenside, 56u8),
+        };
+        let sq = |file: u8| Square::new(base + file).unwrap(); // la case de cette colonne sur la rangée de base
+        let occupied = self.occupied();
+
+        // le roi doit être sur sa case (colonne 4) et ne pas être en échec
+        if !self.pieces(us, Piece::King).contains(sq(4)) || self.is_attacked(sq(4), them) {
+            return;
+        }
+
+        // petit roque : tour en colonne 7, cases f et g (5 et 6) vides, f non attaquée
+        if kingside
+            && self.pieces(us, Piece::Rook).contains(sq(7))
+            && !occupied.contains(sq(5))
+            && !occupied.contains(sq(6))
+            && !self.is_attacked(sq(5), them)
+        {
+            moves.push(Move::new(sq(4), sq(6), None));
+        }
+
+        if queenside
+            && self.pieces(us, Piece::Rook).contains(sq(0))
+            && !occupied.contains(sq(1))
+            && !occupied.contains(sq(2))
+            && !occupied.contains(sq(3))
+            && !self.is_attacked(sq(3), them) 
+        {
+            moves.push(Move::new(sq(4), sq(2), None));
+        }
+    }
+
+    pub fn pseudo_legal_moves(&self) -> Vec<Move> {
+        let mut moves = Vec::with_capacity(64);
+        self.pawn_moves(&mut moves);
+        self.knight_moves(&mut moves);
+        self.bishop_moves(&mut moves);
+        self.rook_moves(&mut moves);
+        self.queen_moves(&mut moves);
+        self.king_moves(&mut moves);
+        self.castle_moves(&mut moves);
+        moves
+    }
+
+    pub fn legal_moves(&self) -> Vec<Move> {
+        let us = self.turn; // à lire AVANT make_move : le trait change après
+        let mut legal = Vec::with_capacity(48);
+
+        for mv in self.pseudo_legal_moves() {
+            let mut next = self.clone();
+            next.make_move(mv);
+
+            let safe = match next.king_square(us) {
+                Some(king) => !next.is_attacked(king, us.opposite()),
+                None => true,
+            };
+            if safe {
+                legal.push(mv);
+            }
+        }
+        legal
+    }
+}
+
+
+
+fn push_pawn_move(moves: &mut Vec<Move>, from: Square, to: Square, promo_rank: u8) {
+    if to.rank() == promo_rank {
+        for piece in [Piece::Queen, Piece::Rook, Piece::Bishop, Piece::Knight] {
+            moves.push(Move::new(from, to, Some(piece)));
+        }
+    } else {
+        moves.push(Move::new(from, to, None));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn knight_moves_from_the_start_position() {
+        let b = Board::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        let mut moves = Vec::new();
+        b.knight_moves(&mut moves);
+        let mut uci: Vec<String> = moves.iter().map(|m| m.to_uci()).collect();
+        uci.sort();
+        assert_eq!(uci, ["b1a3", "b1c3", "g1f3", "g1h3"]);
+    }
+
+    #[test]
+    fn knight_can_capture_but_not_take_its_own_piece() {
+        // cavalier blanc e4 ; pion blanc en c3 (bloque) et pion noir en f6 (capturable)
+        let b = Board::from_fen("4k3/8/5p2/8/4N3/2P5/8/4K3 w - - 0 1").unwrap();
+        let mut moves = Vec::new();
+        b.knight_moves(&mut moves);
+        let uci: Vec<String> = moves.iter().map(|m| m.to_uci()).collect();
+        assert!(uci.contains(&"e4f6".to_string()));     // capture permise
+        assert!(!uci.contains(&"e4c3".to_string()));    // sa propre pièce
+        assert_eq!(uci.len(), 7);                       // 8 cases - la case alliée
+    }
+
+        fn pawn_uci(fen: &str) -> Vec<String> {
+        let b = Board::from_fen(fen).unwrap();
+        let mut moves = Vec::new();
+        b.pawn_moves(&mut moves);
+        let mut uci: Vec<String> = moves.iter().map(|m| m.to_uci()).collect();
+        uci.sort();
+        uci
+    }
+
+    #[test]
+    fn pawn_pushes_and_blocking() {
+        // départ : 8 poussées simples + 8 doubles
+        assert_eq!(pawn_uci("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").len(), 16);
+        // pion e2 bloqué par un pion noir en e3 : ni simple ni double
+        assert!(pawn_uci("4k3/8/8/8/8/4p3/4P3/4K3 w - - 0 1").is_empty());
+        // pion noir : e7e5 et e7e6
+        assert_eq!(pawn_uci("4k3/4p3/8/8/8/8/8/4K3 b - - 0 1"), ["e7e5", "e7e6"]);
+    }
+
+    #[test]
+    fn pawn_promotions_and_en_passant() {
+        // promotion simple : 4 coups
+        assert_eq!(
+            pawn_uci("4k3/P7/8/8/8/8/8/4K3 w - - 0 1"),
+            ["a7a8b", "a7a8n", "a7a8q", "a7a8r"]
+        );
+        // avec un cavalier noir en b8 : 4 promotions en poussant + 4 en capturant
+        assert_eq!(pawn_uci("1n2k3/P7/8/8/8/8/8/4K3 w - - 0 1").len(), 8);
+        // prise en passant : e5 peut pousser en e6 ou prendre en d6
+        assert_eq!(pawn_uci("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1"), ["e5d6", "e5e6"]);
+    }
+
+        fn castle_uci(fen: &str) -> Vec<String> {
+        let b = Board::from_fen(fen).unwrap();
+        let mut moves = Vec::new();
+        b.castle_moves(&mut moves);
+        let mut uci: Vec<String> = moves.iter().map(|m| m.to_uci()).collect();
+        uci.sort();
+        uci
+    }
+
+    #[test]
+    fn castling_rules() {
+        // tout est libre : les deux roques, pour chaque couleur
+        assert_eq!(castle_uci("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"), ["e1c1", "e1g1"]);
+        assert_eq!(castle_uci("r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1"), ["e8c8", "e8g8"]);
+        // pas de droit
+        assert!(castle_uci("r3k2r/8/8/8/8/8/8/R3K2R w - - 0 1").is_empty());
+        // un fou en f1 bloque le petit roque
+        assert_eq!(castle_uci("r3k2r/8/8/8/8/8/8/R3KB1R w KQkq - 0 1"), ["e1c1"]);
+        // une tour noire en f8 attaque f1 : le petit roque est interdit
+        assert_eq!(castle_uci("5r1k/8/8/8/8/8/8/R3K2R w KQ - 0 1"), ["e1c1"]);
+        // le roi est en échec (tour e8) : aucun roque
+        assert!(castle_uci("4r2k/8/8/8/8/8/8/R3K2R w KQ - 0 1").is_empty());
+        // b1 attaquée (tour b8) ne gêne pas le grand roque
+        assert_eq!(castle_uci("1r5k/8/8/8/8/8/8/R3K2R w KQ - 0 1"), ["e1c1", "e1g1"]);
+        // un cavalier en b1 bloque le grand roque, même si le roi ne traverse pas b1
+        assert_eq!(castle_uci("r3k2r/8/8/8/8/8/8/RN2K2R w KQkq - 0 1"), ["e1g1"]);
+    }
+
+    #[test]
+    fn legal_move_counts_and_pins() {
+        let count = |fen: &str| Board::from_fen(fen).unwrap().legal_moves().len();
+
+        assert_eq!(count("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"), 20);
+        // Kiwipete : 48 coups (valeur publiée)
+        assert_eq!(count("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"), 48);
+
+        // cavalier cloué en e2 par la tour e8 : seul le roi peut jouer
+        let b = Board::from_fen("4r2k/8/8/8/8/8/4N3/4K3 w - - 0 1").unwrap();
+        let legal = b.legal_moves();
+        assert_eq!(legal.len(), 4);
+        assert!(legal.iter().all(|m| m.from.to_uci() == "e1"));
+    }
+}=== src/engine/perft.rs ===
+use super::Board;
+
+impl Board {
+    pub fn _perft(&self, depth: u32) -> u64 {
+        if depth == 0 {
+            return 1;
+        }
+        let moves = self.legal_moves();
+        if depth == 1 {
+            return moves.len() as u64; // inutile de jouer le dernier coup
+        }
+        moves
+            .iter()
+            .map(|&mv| {
+                let mut next = self.clone();
+                next.make_move(mv);
+                next._perft(depth - 1)
+            })
+            .sum()
+    }
+
+    /// Le perft de chaque coup de la racine : sert à localiser un bug.
+    pub fn _divide(&self, depth: u32) -> Vec<(String, u64)> {
+        let mut result: Vec<(String, u64)> = self
+            .legal_moves()
+            .iter()
+            .map(|&mv| {
+                let mut next = self.clone();
+                next.make_move(mv);
+                (mv.to_uci(), next._perft(depth - 1))
+            })
+            .collect();
+        result.sort();
+        result
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CASES: &[(&str, &str, &[u64])] = &[
+        ("startpos", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            &[20, 400, 8_902, 197_281, 4_865_609]),
+        ("kiwipete", "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            &[48, 2_039, 97_862, 4_085_603]),
+        ("pos3", "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            &[14, 191, 2_812, 43_238, 674_624]),
+        ("pos4", "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+            &[6, 264, 9_467, 422_333]),
+        ("pos5", "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+            &[44, 1_486, 62_379, 2_103_487]),
+        ("pos6", "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+            &[46, 2_079, 89_890, 3_894_594]),
+    ];
+
+    #[ignore]
+    #[test]
+    fn perft_reference_positions() {
+        for (name, fen, expected) in CASES {
+            let board = Board::from_fen(fen).unwrap();
+            for (i, &exp) in expected.iter().enumerate() {
+                let depth = (i + 1) as u32;
+                assert_eq!(board._perft(depth), exp, "{name} à la profondeur {depth}");
+            }
+        }
+    }
+    }=== src/bots/mod.rs ===
+pub mod random;
+pub mod minimax;
+
+pub use random::BotRandom;
+pub use minimax::BotMiniMax;
+
+use crate::engine::{Move, Board};
+
+pub trait BotTrait {
+    fn play_move(&self, board: &Board) -> Option<Move>;
+}=== src/bots/random.rs ===
+use super::BotTrait;
+use crate::engine::{Move, Board};
+
+pub struct BotRandom;
+
+impl BotTrait for BotRandom {
+    fn play_move(&self, board: &Board) -> Option<Move> {
+        let moves = board.legal_moves();
+
+        if moves.len() == 0 {
+            return None
+        }
+
+        Some(moves[rand::random_range(..moves.len())])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{Piece, Color};
+
+    #[test]
+    fn random_games_keep_both_kings_and_never_panic() {
+        let bot = BotRandom;
+        for _ in 0..100 {
+            let mut board = Board::startpos();
+            for _ in 0..300 {
+                let Some(mv) = bot.play_move(&board) else { break }; // mat ou pat
+                board.make_move(mv);
+                assert_eq!(board.pieces(Color::White, Piece::King).count(), 1);
+                assert_eq!(board.pieces(Color::Black, Piece::King).count(), 1);
+            }
+        }
+    }
+}=== src/bots/minimax.rs ===
+use super::BotTrait;
+use crate::engine::{Move, Board, Square};
+
+pub struct BotMiniMax;
+
+impl BotTrait for BotMiniMax {
+    fn play_move(&self, board: &Board) -> Option<Move> {
+
+
+
+        None
+    }
+}
+
+
+=== src/api.rs ===
+use std::error::Error;
+use std::sync::Arc;
+
+use futures_util::StreamExt;
+
+use litchee::LichessClient;
+use litchee::api::gameplay::board::{LichessBoardEvent, LichessGameEventInfo, LichessGameState, LichessIncomingEvent};
+use litchee::api::gameplay::challenges::LichessChallenge;
+use litchee::model::LichessColor;
+
+use crate::bots::{BotTrait, BotRandom, };//BotMiniMax};
+use crate::engine::{Move, Color, board::*};
+
+
+pub struct Api {
+    client: Arc<LichessClient>
+}
+
+impl Api {
+    pub fn new() -> Self {
+        let token = std::env::var("LICHESS_TOKEN").expect("Pas de token .env");
+        let client = LichessClient::builder().token(token).build().expect("Token error");
+        Api { client: Arc::new(client) }
+    }
+
+    pub async fn loop_event(&self) -> Result<(), Box<dyn Error>>{
+        let mut stream = self.client.bot().stream_events().await?;
+
+        while let Some(event) = stream.next().await {
+            match event? {
+                LichessIncomingEvent::Challenge { challenge } => {
+                    if let Err(e) = self.handle_challenge(challenge).await {
+                        eprintln!("Défi ignoré : {e}");
+                    }
+                }
+                LichessIncomingEvent::GameStart { game } => {
+                    if let Err(e) = self.handle_start(game).await {
+                        eprintln!("Démarrage de partie échoué : {e}");
+                    }
+                }
+                LichessIncomingEvent::GameFinish { game } => {
+                    let _game = game;
+                }
+                LichessIncomingEvent::ChallengeCanceled { challenge } => {
+                    let _challenge = challenge;
+                }
+                LichessIncomingEvent::ChallengeDeclined { challenge } => {
+                    let _challenge = challenge;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_challenge(&self, chal: Box<LichessChallenge>) -> Result<(), Box<dyn Error>> {
+        self.client.challenges().accept(&chal.id, None).await?;
+        Ok(())
+    }
+
+    async fn handle_start(&self, game_info: LichessGameEventInfo) -> Result<(), Box<dyn Error>> {
+        let color = match game_info.color.unwrap_or(LichessColor::White) {
+            LichessColor::White => Color::White,
+            LichessColor::Black => Color::Black
+        };
+
+        let client_clone = Arc::clone(&self.client);
+        let Some(id) = game_info.id else {
+            eprintln!("GameStart sans identifiant");
+            return Ok(());
+        };
+
+        tokio::spawn(async move {
+            let mut game = Game::new(client_clone, id, color, BotRandom);
+
+            game.main_loop().await.unwrap_or_else(|e| {
+                eprintln!("Erreur critique dans la partie {}: {}", game.id, e);
+            });
+        });
+        Ok(())
+    }
+}
+
+
+#[derive(Debug)]
+struct Game<B: BotTrait> {
+    client: Arc<LichessClient>,
+    id: String,
+    board: Board,
+    color: Color,
+    board_move: usize,
+    sent_move: Option<usize>,
+    bot: B
+}
+
+impl <B: BotTrait> Game<B>{
+    fn new(client: Arc<LichessClient>, id: String, color: Color, bot: B) -> Self {
+        Game {
+            client,
+            id,
+            board: Board::startpos(),
+            color,
+            board_move: 0,
+            sent_move: None,
+            bot
+        }
+    }
+
+    async fn main_loop(&mut self) -> Result<(), Box<dyn Error>> {
+        let mut game_stream = self.client.bot().stream_game(&self.id).await?;
+
+        while let Some(game_event) = game_stream.next().await {
+            match game_event? {
+                LichessBoardEvent::GameFull(game_full) => {
+                    self.check_state(game_full.state).await?;
+                }
+                LichessBoardEvent::GameState(state) => {
+                    self.check_state(state).await?;
+                }
+                LichessBoardEvent::OpponentGone(gone) => {
+                    println!("{:#?}", gone);
+                }
+                LichessBoardEvent::ChatLine(chat) => {
+                    println!("{:#?}", chat);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    } 
+
+    async fn check_state(&mut self, state: LichessGameState) -> Result<(), Box<dyn Error>>{
+        let movs: Vec<&str> = state.moves.split_whitespace().collect();
+
+        for m in &movs[self.board_move..] {
+            let mov_to_play = Move::from_uci(m).ok_or_else(|| format!("coup illisible : {m}"))?;
+            self.board.make_move(mov_to_play);
+        }
+
+        self.board_move = movs.len();
+
+        if self.color == self.board.turn && self.sent_move != Some(self.board_move) {
+            if let Some(mv) = self.bot.play_move(&self.board) {
+                match self.play_mov(mv).await {
+                    Ok(()) => self.sent_move = Some(self.board_move),
+                    Err(e) => eprintln!("Partie {} : coup refusé : {e}", self.id),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn play_mov(&self,mov: Move) -> Result<(), Box<dyn Error>> {
+        let mov = mov.to_uci();
+
+        self.client.bot().make_move(&self.id, &mov, false).await?;
+        Ok(())
+    }    
+}

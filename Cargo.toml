@@ -1,0 +1,16 @@
+[package]
+name = "chess-bot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dotenvy = "0.15.7"
+futures-util = "0.3.34"
+litchee = "0.2.0"
+rand = "0.10.3"
+tokio = { version = "1.54.1", features = ["full"] }
+
+
+[alias]
+t  = "test --lib"
+tr = "test --release"
